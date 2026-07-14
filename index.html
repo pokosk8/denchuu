@@ -661,7 +661,7 @@ function renderList() {
   const sorted = [...data].sort((a, b) => b.createdAt - a.createdAt);
   area.innerHTML = sorted.map(entry => `
     <div class="list-item" onclick="showDetail('${entry.id}')">
-      <span class="list-item-icon">⚡</span>
+      <span class="list-item-icon">${entry.accuracy != null && entry.accuracy > 50 ? '⚠️' : '⚡'}</span>
       <div class="list-item-body">
         <div class="list-item-number">${escHtml(entry.number)}</div>
         <div class="list-item-sub">${entry.memo ? escHtml(entry.memo) : `${entry.lat.toFixed(5)}, ${entry.lng.toFixed(5)}`}</div>
@@ -690,6 +690,7 @@ function doSearch() {
         <div class="result-label ok">✅ 登録あり</div>
         <div class="pole-number-display">${escHtml(entry.number)}</div>
         <div class="coord-display">📍 ${entry.lat.toFixed(6)}, ${entry.lng.toFixed(6)}</div>
+        ${accuracyBadge(entry.accuracy)}
         ${entry.memo ? `<div class="memo-display">📝 ${escHtml(entry.memo)}</div>` : ''}
         <div class="card-actions">
           <a class="map-link" href="${mapsUrl}" target="_blank">🗺 Mapsで開く</a>
@@ -750,6 +751,7 @@ function showDetail(id) {
       <div class="result-label ok">✅ 登録済み</div>
       <div class="pole-number-display">${escHtml(entry.number)}</div>
       <div class="coord-display">📍 ${entry.lat.toFixed(6)}, ${entry.lng.toFixed(6)}</div>
+      ${accuracyBadge(entry.accuracy)}
       ${entry.memo ? `<div class="memo-display">📝 ${escHtml(entry.memo)}</div>` : ''}
       <div class="card-actions">
         <a class="map-link" href="${mapsUrl}" target="_blank">🗺 Mapsで開く</a>
@@ -761,6 +763,18 @@ function showDetail(id) {
   window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
+// GPS精度バッジのHTMLを生成（精度不明なら何も出さない）
+function accuracyBadge(accuracy) {
+  if (accuracy == null || isNaN(accuracy)) return '';
+  const acc = Math.round(accuracy);
+  if (acc <= 15) {
+    return `<div class="coord-display" style="color:var(--success);">🎯 登録時のGPS精度: ±${acc}m</div>`;
+  } else if (acc <= 50) {
+    return `<div class="coord-display" style="color:var(--accent);">🎯 登録時のGPS精度: ±${acc}m（やや粗め）</div>`;
+  }
+  return `<div class="coord-display" style="color:var(--danger);">⚠️ 登録時のGPS精度: ±${acc}m（誤差大きめ・現地で再確認推奨）</div>`;
+}
+
 // 登録フォームを開く
 function openRegister(number = '') {
   document.getElementById('regNumber').value = number;
@@ -768,6 +782,7 @@ function openRegister(number = '') {
   document.getElementById('regLng').value = '';
   document.getElementById('regMemo').value = '';
   document.getElementById('gpsStatus').textContent = '';
+  lastGpsAccuracy = null;
   document.getElementById('registerForm').style.display = 'block';
   document.getElementById('resultArea').innerHTML = '';
   document.getElementById('registerForm').scrollIntoView({behavior: 'smooth'});
@@ -775,13 +790,31 @@ function openRegister(number = '') {
 
 // 登録キャンセル
 function cancelRegister() {
+  stopGpsWatch();
   document.getElementById('registerForm').style.display = 'none';
 }
 
 // GPS取得
+// 田舎など電波支援(A-GPS)が弱い場所では、最初の1回のfixが数百m単位でズレたまま
+// 「取得完了」扱いになってしまうことがあるため、一定時間 watchPosition で
+// 継続測位して一番精度の良い値を採用する方式に変更。
+let gpsWatchId = null;
+let gpsBestFix = null;
+let gpsAutoStopTimer = null;
+const GPS_GOOD_ENOUGH_M = 8;      // これ以下ならすぐ確定
+const GPS_MAX_WAIT_MS = 25000;    // 最長でもこの時間で強制確定
+
+let lastGpsAccuracy = null; // saveEntry() で参照して登録データに残す
+
 function getGPS() {
   const btn = document.getElementById('gpsBtn');
   const status = document.getElementById('gpsStatus');
+
+  // 測位中に再タップされたら、そこで打ち切って現時点のベストを採用
+  if (gpsWatchId !== null) {
+    finalizeGPS();
+    return;
+  }
 
   if (!navigator.geolocation) {
     status.textContent = 'このブラウザはGPSに対応していません';
@@ -789,28 +822,80 @@ function getGPS() {
     return;
   }
 
-  btn.textContent = '⏳';
+  gpsBestFix = null;
+  btn.textContent = '⏹';
   btn.classList.add('loading');
-  status.textContent = '取得中...';
+  status.textContent = '📡 測位中…（精度が安定するまで数秒待つか、タップで確定）';
   status.className = 'gps-status';
 
-  navigator.geolocation.getCurrentPosition(
+  gpsWatchId = navigator.geolocation.watchPosition(
     pos => {
-      document.getElementById('regLat').value = pos.coords.latitude.toFixed(6);
-      document.getElementById('regLng').value = pos.coords.longitude.toFixed(6);
-      btn.textContent = '📡';
-      btn.classList.remove('loading');
-      status.textContent = `✅ 取得完了（精度: ±${Math.round(pos.coords.accuracy)}m）`;
-      status.className = 'gps-status ok';
+      if (!gpsBestFix || pos.coords.accuracy < gpsBestFix.coords.accuracy) {
+        gpsBestFix = pos;
+      }
+      const nowAcc = Math.round(pos.coords.accuracy);
+      const bestAcc = Math.round(gpsBestFix.coords.accuracy);
+      status.textContent = `📡 測位中… 現在±${nowAcc}m（最良±${bestAcc}m）／タップで確定`;
+      status.className = 'gps-status';
+
+      if (pos.coords.accuracy <= GPS_GOOD_ENOUGH_M) {
+        finalizeGPS();
+      }
     },
     err => {
-      btn.textContent = '📡';
-      btn.classList.remove('loading');
       status.textContent = `❌ GPS取得失敗: ${err.message}`;
       status.className = 'gps-status err';
+      stopGpsWatch();
+      btn.textContent = '📡';
+      btn.classList.remove('loading');
     },
-    { enableHighAccuracy: true, timeout: 10000 }
+    { enableHighAccuracy: true, timeout: GPS_MAX_WAIT_MS, maximumAge: 0 }
   );
+
+  gpsAutoStopTimer = setTimeout(() => {
+    if (gpsWatchId !== null) finalizeGPS();
+  }, GPS_MAX_WAIT_MS);
+}
+
+function stopGpsWatch() {
+  if (gpsWatchId !== null) {
+    navigator.geolocation.clearWatch(gpsWatchId);
+    gpsWatchId = null;
+  }
+  if (gpsAutoStopTimer !== null) {
+    clearTimeout(gpsAutoStopTimer);
+    gpsAutoStopTimer = null;
+  }
+}
+
+function finalizeGPS() {
+  const btn = document.getElementById('gpsBtn');
+  const status = document.getElementById('gpsStatus');
+  stopGpsWatch();
+  btn.textContent = '📡';
+  btn.classList.remove('loading');
+
+  if (!gpsBestFix) {
+    status.textContent = '❌ 位置を取得できませんでした';
+    status.className = 'gps-status err';
+    return;
+  }
+
+  const acc = Math.round(gpsBestFix.coords.accuracy);
+  lastGpsAccuracy = acc;
+  document.getElementById('regLat').value = gpsBestFix.coords.latitude.toFixed(6);
+  document.getElementById('regLng').value = gpsBestFix.coords.longitude.toFixed(6);
+
+  if (acc <= 15) {
+    status.textContent = `✅ 取得完了（精度: ±${acc}m）`;
+    status.className = 'gps-status ok';
+  } else if (acc <= 50) {
+    status.textContent = `⚠️ 取得完了だが精度やや低め（±${acc}m）。可能なら電波の良い場所で再取得推奨`;
+    status.className = 'gps-status';
+  } else {
+    status.textContent = `⚠️ 精度が低いです（±${acc}m）。開けた場所でもう一度📡を押して再測位を推奨`;
+    status.className = 'gps-status err';
+  }
 }
 
 // 登録保存
@@ -827,13 +912,14 @@ function saveEntry() {
   }
 
   const data = loadData();
+  const accuracy = lastGpsAccuracy; // 直近のGPS確定精度(m)。手入力のみの場合はnull
 
   // 重複チェック
   const existing = data.find(e => e.number.toUpperCase() === number);
   if (existing) {
     if (!confirm(`「${number}」はすでに登録済みです。上書きしますか？`)) return;
     const idx = data.indexOf(existing);
-    data[idx] = { ...existing, lat, lng, memo, updatedAt: Date.now() };
+    data[idx] = { ...existing, lat, lng, memo, accuracy, updatedAt: Date.now() };
   } else {
     data.push({
       id: Date.now().toString(),
@@ -841,6 +927,7 @@ function saveEntry() {
       lat,
       lng,
       memo,
+      accuracy,
       createdAt: Date.now(),
       updatedAt: Date.now()
     });
