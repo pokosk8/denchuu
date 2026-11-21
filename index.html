@@ -783,6 +783,7 @@ function openRegister(number = '') {
   document.getElementById('regMemo').value = '';
   document.getElementById('gpsStatus').textContent = '';
   lastGpsAccuracy = null;
+  lastGpsStable = null;
   document.getElementById('registerForm').style.display = 'block';
   document.getElementById('resultArea').innerHTML = '';
   document.getElementById('registerForm').scrollIntoView({behavior: 'smooth'});
@@ -795,22 +796,69 @@ function cancelRegister() {
 }
 
 // GPS取得
-// 田舎など電波支援(A-GPS)が弱い場所では、最初の1回のfixが数百m単位でズレたまま
-// 「取得完了」扱いになってしまうことがあるため、一定時間 watchPosition で
-// 継続測位して一番精度の良い値を採用する方式に変更。
+// iPhoneは電波が弱い場所だと、Wi-Fi/基地局ベースの位置を「±5m」などと自信満々に返して
+// 実際は100m以上ズレることがある。accuracyの数字(自己申告)や1回のfixは信用せず、
+// 複数回の測位が互いに近い位置にまとまっている(=安定している)ときだけ確定する。
+// 確定値は最後の数回の中央値。バラついたままなら「信用できない」と警告する。
 let gpsWatchId = null;
-let gpsBestFix = null;
+let gpsFixes = [];          // この測位セッションで受け取ったfix {lat, lng, acc}
+let gpsStartedAt = 0;
 let gpsAutoStopTimer = null;
-const GPS_GOOD_ENOUGH_M = 8;      // これ以下ならすぐ確定
-const GPS_MAX_WAIT_MS = 25000;    // 最長でもこの時間で強制確定
+const GPS_MIN_WAIT_MS = 8000;     // GPSが収束するのを待つ最短時間(これ未満では自動確定しない)
+const GPS_MAX_WAIT_MS = 30000;    // 最長でもこの時間で強制確定
+const GPS_STABLE_COUNT = 3;       // 直近この回数のfixが揃っていれば安定とみなす
+const GPS_STABLE_RADIUS_M = 10;   // 揃っている=中央値からこの距離以内
+const GPS_USABLE_ACC_M = 30;      // 自己申告accuracyがこれ以下のfixだけ安定判定に使う
 
 let lastGpsAccuracy = null; // saveEntry() で参照して登録データに残す
+let lastGpsStable = null;   // true:安定 / false:バラついた / null:GPS未使用
+
+// 2点間の距離(m)。数百m以内なら十分な近似
+function gpsDistM(lat1, lng1, lat2, lng2) {
+  const rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad;
+  const dLng = (lng2 - lng1) * rad * Math.cos((lat1 + lat2) / 2 * rad);
+  return 6371000 * Math.sqrt(dLat * dLat + dLng * dLng);
+}
+
+function gpsMedian(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+// fix群の中央値位置と、そこからの最大ブレ(spread)を返す
+function gpsCluster(fixes) {
+  const lat = gpsMedian(fixes.map(f => f.lat));
+  const lng = gpsMedian(fixes.map(f => f.lng));
+  const acc = gpsMedian(fixes.map(f => f.acc));
+  const spread = Math.max(...fixes.map(f => gpsDistM(lat, lng, f.lat, f.lng)));
+  return { lat, lng, acc, spread, n: fixes.length };
+}
+
+// 直近の使えるfixが揃っているか判定
+function gpsEvaluate(fixes) {
+  const usable = fixes.filter(f => f.acc <= GPS_USABLE_ACC_M);
+  if (usable.length < GPS_STABLE_COUNT) return { stable: false, usableCount: usable.length };
+  const c = gpsCluster(usable.slice(-GPS_STABLE_COUNT));
+  return { stable: c.spread <= GPS_STABLE_RADIUS_M, usableCount: usable.length, cluster: c };
+}
+
+// 直近に登録した電柱(あれば)までの距離表示用
+function gpsNearestRecentNote(lat, lng) {
+  const data = loadData();
+  if (!data.length) return '';
+  const last = data.reduce((a, b) => ((b.updatedAt || 0) > (a.updatedAt || 0) ? b : a));
+  if (typeof last.lat !== 'number' || typeof last.lng !== 'number') return '';
+  const d = Math.round(gpsDistM(lat, lng, last.lat, last.lng));
+  return `／📏 直近の登録「${last.number}」から約${d}m`;
+}
 
 function getGPS() {
   const btn = document.getElementById('gpsBtn');
   const status = document.getElementById('gpsStatus');
 
-  // 測位中に再タップされたら、そこで打ち切って現時点のベストを採用
+  // 測位中に再タップされたら、そこで打ち切って現時点の結果を採用
   if (gpsWatchId !== null) {
     finalizeGPS();
     return;
@@ -822,27 +870,40 @@ function getGPS() {
     return;
   }
 
-  gpsBestFix = null;
+  gpsFixes = [];
+  gpsStartedAt = Date.now();
   btn.textContent = '⏹';
   btn.classList.add('loading');
-  status.textContent = '📡 測位中…（精度が安定するまで数秒待つか、タップで確定）';
+  status.textContent = '📡 測位中…（位置が安定するまで数秒〜十数秒待つか、タップで確定）';
   status.className = 'gps-status';
 
   gpsWatchId = navigator.geolocation.watchPosition(
     pos => {
-      if (!gpsBestFix || pos.coords.accuracy < gpsBestFix.coords.accuracy) {
-        gpsBestFix = pos;
-      }
+      // 測位開始より前の古い(キャッシュされた)位置は捨てる
+      if (pos.timestamp < gpsStartedAt - 1000) return;
+      gpsFixes.push({
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude,
+        acc: pos.coords.accuracy
+      });
+      if (gpsFixes.length > 40) gpsFixes.shift();
+
+      const ev = gpsEvaluate(gpsFixes);
       const nowAcc = Math.round(pos.coords.accuracy);
-      const bestAcc = Math.round(gpsBestFix.coords.accuracy);
-      status.textContent = `📡 測位中… 現在±${nowAcc}m（最良±${bestAcc}m）／タップで確定`;
+      const have = Math.min(ev.usableCount, GPS_STABLE_COUNT);
+      status.textContent = `📡 測位中… 現在±${nowAcc}m／安定チェック ${have}/${GPS_STABLE_COUNT}／タップで確定`;
       status.className = 'gps-status';
 
-      if (pos.coords.accuracy <= GPS_GOOD_ENOUGH_M) {
+      if (ev.stable && Date.now() - gpsStartedAt >= GPS_MIN_WAIT_MS) {
         finalizeGPS();
       }
     },
     err => {
+      // 何回か取れていて、最後の更新待ちがタイムアウトしただけなら、取れた分で確定する
+      if (err.code === 3 && gpsFixes.length > 0) {
+        finalizeGPS();
+        return;
+      }
       status.textContent = `❌ GPS取得失敗: ${err.message}`;
       status.className = 'gps-status err';
       stopGpsWatch();
@@ -875,25 +936,46 @@ function finalizeGPS() {
   btn.textContent = '📡';
   btn.classList.remove('loading');
 
-  if (!gpsBestFix) {
+  if (gpsFixes.length === 0) {
     status.textContent = '❌ 位置を取得できませんでした';
     status.className = 'gps-status err';
     return;
   }
 
-  const acc = Math.round(gpsBestFix.coords.accuracy);
-  lastGpsAccuracy = acc;
-  document.getElementById('regLat').value = gpsBestFix.coords.latitude.toFixed(6);
-  document.getElementById('regLng').value = gpsBestFix.coords.longitude.toFixed(6);
+  // 安定していればその3回の中央値。そうでなければ、使えるfix(なければ全部)の直近5回の中央値で
+  // 「参考値」として入れるが、不安定フラグを立てる
+  const ev = gpsEvaluate(gpsFixes);
+  let c, stable;
+  if (ev.stable) {
+    c = ev.cluster;
+    stable = true;
+  } else {
+    const usable = gpsFixes.filter(f => f.acc <= GPS_USABLE_ACC_M);
+    const pool = (usable.length ? usable : gpsFixes).slice(-5);
+    c = gpsCluster(pool);
+    stable = false;
+  }
 
-  if (acc <= 15) {
-    status.textContent = `✅ 取得完了（精度: ±${acc}m）`;
+  // 自己申告accuracyより、実際の測位のバラつきの方が大きければそっちを採用(正直な精度)
+  const acc = Math.round(Math.max(c.acc, c.spread));
+  const spread = Math.round(c.spread);
+  lastGpsAccuracy = acc;
+  lastGpsStable = stable;
+  document.getElementById('regLat').value = c.lat.toFixed(6);
+  document.getElementById('regLng').value = c.lng.toFixed(6);
+
+  const note = gpsNearestRecentNote(c.lat, c.lng);
+  if (!stable) {
+    status.textContent = `🚨 測位がバラついています（最大${spread}mのブレ）。この位置は信用できません。少し場所を変えるか時間をおいて、もう一度📡を押してください${note}`;
+    status.className = 'gps-status err';
+  } else if (acc <= 15) {
+    status.textContent = `✅ 取得完了（精度: ±${acc}m・${c.n}回の測位が一致）${note}`;
     status.className = 'gps-status ok';
   } else if (acc <= 50) {
-    status.textContent = `⚠️ 取得完了だが精度やや低め（±${acc}m）。可能なら電波の良い場所で再取得推奨`;
+    status.textContent = `⚠️ 取得完了だが精度やや低め（±${acc}m）。可能なら電波の良い場所で再取得推奨${note}`;
     status.className = 'gps-status';
   } else {
-    status.textContent = `⚠️ 精度が低いです（±${acc}m）。開けた場所でもう一度📡を押して再測位を推奨`;
+    status.textContent = `⚠️ 精度が低いです（±${acc}m）。開けた場所でもう一度📡を押して再測位を推奨${note}`;
     status.className = 'gps-status err';
   }
 }
@@ -909,6 +991,10 @@ function saveEntry() {
   if (isNaN(lat) || isNaN(lng)) { alert('GPS座標を入力またはGPS取得してください'); return; }
   if (lat < 20 || lat > 50 || lng < 120 || lng > 150) {
     if (!confirm('座標が日本国内の範囲外です。このまま登録しますか？')) return;
+  }
+
+  if (lastGpsStable === false) {
+    if (!confirm('GPSの測位がバラついていて、この位置は信用できません。このまま登録しますか？')) return;
   }
 
   const data = loadData();
